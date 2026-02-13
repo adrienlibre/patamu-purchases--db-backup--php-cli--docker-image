@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+
+# Note: On local development a volume is created by docker compose. This means that between container restarts, the data in the container
+# persists:
+# - if /source folder is deleted, the rsync and rm commands fail. 
+# On production there is no problem. On AWS ECS, on every container change a new container is created, picking the data from
+# the image build (which always contain the /source directory populated).
+if [ -d /source ] && [ "$(find /source -mindepth 1 -print -quit)" ]; then
+
+    # Move all the source files to the cli application directory (which, on production, is also the mounted path of the volume).
+    # The command will override the existing files and directories in the /opt/innovaetica-cli-app/ directory
+    rsync -a --delete --exclude='storage/' /source/ /opt/innovaetica-cli-app/
+
+    # Synchronize the storage directory separately
+    if [ -d /source/storage/ ]; then
+        rsync -a /source/storage/ /opt/innovaetica-cli-app/storage/
+    fi
+
+    # Remove the contents of the directory
+    rm -rf /source/* /source/.[!.]* /source/..?* || { echo "Failed to remove contents of /source"; exit 1; }
+fi
+
+# Determine which artisan command to run
+if [ $# -gt 0 ]; then
+    # If arguments are provided, execute them directly
+    echo "Executing: $@"
+    exec "$@"
+else
+    # No arguments provided, check environment variable or use default
+    COMMAND="${ARTISAN_COMMAND:-db-backup:create}"
+    echo "Executing: php artisan ${COMMAND}"
+    exec php artisan "${COMMAND}"
+fi
