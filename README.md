@@ -2,7 +2,65 @@
 
 This is the **Docker** image of the tiny Laravel app that is used to do database backups of patamu-purchases' database.
 
-## **Preliminary tasks**
+## Table of Contents
+
+- [patamu-purchases Db Backup Docker Image](#patamu-purchases-db-backup-docker-image)
+  - [Table of Contents](#table-of-contents)
+  - [Preliminary tasks](#preliminary-tasks)
+    - [Create base image repositories](#create-base-image-repositories)
+    - [Create our Docker image repository](#create-our-docker-image-repository)
+    - [Create a *pull through cache* rule](#create-a-pull-through-cache-rule)
+    - [Personal Access Token for Composer](#personal-access-token-for-composer)
+  - [Generate our patamu-purchases-db-backup-php image](#generate-our-patamu-purchases-db-backup-php-image)
+    - [Build](#build)
+    - [Push](#push)
+    - [Document the tag changes on UPGRADES.md](#document-the-tag-changes-on-upgradesmd)
+  - [Deploy ECS Service for Database Backup](#deploy-ecs-service-for-database-backup)
+    - [Step 1: Create Task Execution Role](#step-1-create-task-execution-role)
+      - [1.1. Create the trust policy file](#11-create-the-trust-policy-file)
+      - [1.2. Create the execution role](#12-create-the-execution-role)
+      - [1.3. Create the permissions policy file](#13-create-the-permissions-policy-file)
+      - [1.4. Attach the permissions policy to the role](#14-attach-the-permissions-policy-to-the-role)
+      - [1.5. Verify the role was created and save its ARN](#15-verify-the-role-was-created-and-save-its-arn)
+    - [Step 2: Create Task Role](#step-2-create-task-role)
+      - [2.1. Create the trust policy file](#21-create-the-trust-policy-file)
+      - [2.2. Create the task role](#22-create-the-task-role)
+      - [2.3. Create the permissions policy file](#23-create-the-permissions-policy-file)
+      - [2.4. Attach the permissions policy to the role](#24-attach-the-permissions-policy-to-the-role)
+      - [2.5. Verify the role and save its ARN](#25-verify-the-role-and-save-its-arn)
+    - [Step 3: Create EventBridge Role](#step-3-create-eventbridge-role)
+      - [3.1. Store the role ARNs in variables](#31-store-the-role-arns-in-variables)
+      - [3.2. Create the EventBridge trust policy file](#32-create-the-eventbridge-trust-policy-file)
+      - [3.3. Create the EventBridge role](#33-create-the-eventbridge-role)
+      - [3.4. Create the EventBridge permissions policy file](#34-create-the-eventbridge-permissions-policy-file)
+      - [3.5. Attach the permissions policy to the role](#35-attach-the-permissions-policy-to-the-role)
+      - [3.6. Verify the EventBridge role and save its ARN](#36-verify-the-eventbridge-role-and-save-its-arn)
+    - [Step 4: Create CloudWatch Log Group](#step-4-create-cloudwatch-log-group)
+    - [Step 5: Register ECS Task Definition](#step-5-register-ecs-task-definition)
+      - [5.1. Create the task definition file](#51-create-the-task-definition-file)
+      - [5.2. Register the task definition](#52-register-the-task-definition)
+      - [5.3. Save the task definition ARN](#53-save-the-task-definition-arn)
+    - [Step 6: Create EventBridge Scheduled Rules](#step-6-create-eventbridge-scheduled-rules)
+      - [6.1. Create the backup creation schedule rule](#61-create-the-backup-creation-schedule-rule)
+      - [6.2. Get network configuration from existing task (the one where the main Purchases web app is located)](#62-get-network-configuration-from-existing-task-the-one-where-the-main-purchases-web-app-is-located)
+      - [6.3. Set the cluster ARN](#63-set-the-cluster-arn)
+      - [6.4. Create the backup creation targets file](#64-create-the-backup-creation-targets-file)
+      - [6.5. Add the backup creation task as a target to the EventBridge rule](#65-add-the-backup-creation-task-as-a-target-to-the-eventbridge-rule)
+      - [6.6. Create the backup deletion schedule rule](#66-create-the-backup-deletion-schedule-rule)
+      - [6.7. Create the backup deletion targets file](#67-create-the-backup-deletion-targets-file)
+      - [6.8. Add the backup deletion task as a target to the EventBridge rule](#68-add-the-backup-deletion-task-as-a-target-to-the-eventbridge-rule)
+    - [Step 7: Verification](#step-7-verification)
+      - [7.1. Verify all IAM roles exist](#71-verify-all-iam-roles-exist)
+      - [7.2. Verify the task definition](#72-verify-the-task-definition)
+      - [7.3. Verify the EventBridge rules and their targets](#73-verify-the-eventbridge-rules-and-their-targets)
+      - [7.4. Manually test the backup tasks](#74-manually-test-the-backup-tasks)
+      - [7.5. Check the task logs](#75-check-the-task-logs)
+  - [**Hints**](#hints)
+    - [Using Private ECR Registry instead of Docker Hub](#using-private-ecr-registry-instead-of-docker-hub)
+    - [Using Private ECR Registry for local development](#using-private-ecr-registry-for-local-development)
+    - [Environment Template Variables Syntax](#environment-template-variables-syntax)
+
+## Preliminary tasks
 
 ### Create base image repositories
 
@@ -50,7 +108,7 @@ On **GitHub** site, access the **Developer Settings** section (our user has to b
 
 Create a file `files/secrets/github-personal-access-token` with just the **PAT** as its content.
 
-## **Generate our patamu-purchases-db-backup-php image**
+## Generate our patamu-purchases-db-backup-php image
 
 ### Build
 
@@ -130,6 +188,708 @@ docker push 280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-
 ### Document the tag changes on UPGRADES.md
 
 It's important to keep track of the evolution of the project. Everytime a new version is released, we should document the related tag and the changes it involves on the file `UPGRADES.md`.
+
+## Deploy ECS Service for Database Backup
+
+This section provides a complete step-by-step guide to deploy scheduled **ECS Fargate** tasks using **AWS CLI**. We'll create two EventBridge schedules: one to run daily for creating database backups, and another to run weekly for deleting old backups. We'll set up the necessary IAM roles, task definition, and EventBridge schedulers.
+
+> **Prerequisites**: Ensure you have the Docker image built and pushed to ECR, and that you're working from the project root directory.
+
+### Step 1: Create Task Execution Role
+
+The **Task Execution Role** allows ECS to pull images from ECR, write logs to CloudWatch, and access other AWS services needed to run the task.
+
+#### 1.1. Create the trust policy file
+
+This trust policy allows the ECS service to assume the role.
+
+```bash
+cat > deploy-to-aws-ecs/task-execution-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+
+#### 1.2. Create the execution role
+
+```bash
+aws iam create-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --assume-role-policy-document file://deploy-to-aws-ecs/task-execution-trust-policy.json
+```
+
+#### 1.3. Create the permissions policy file
+
+This policy grants permissions to pull images from ECR and write logs to CloudWatch.
+
+```bash
+cat > deploy-to-aws-ecs/task-execution-role-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": "ecr:BatchImportUpstreamImage",
+            "Resource": "arn:aws:ecr:eu-central-1:280785378630:repository/patamu-purchases-db-backup-php",
+            "Effect": "Allow"
+        },
+        {
+            "Action": [
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:BatchGetImage",
+                "ecr:GetDownloadUrlForLayer"
+            ],
+            "Resource": "arn:aws:ecr:eu-central-1:280785378630:repository/patamu-purchases-db-backup-php",
+            "Effect": "Allow"
+        },
+        {
+            "Action": "ecr:GetAuthorizationToken",
+            "Resource": "*",
+            "Effect": "Allow"
+        },
+        {
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:eu-central-1:280785378630:log-group:patamu-purchases--db-backup--container--php-cli--log-group:*",
+            "Effect": "Allow"
+        }
+    ]
+}
+EOF
+```
+
+#### 1.4. Attach the permissions policy to the role
+
+```bash
+aws iam put-role-policy \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --policy-name custom-execution-policy \
+  --policy-document file://deploy-to-aws-ecs/task-execution-role-policy.json
+```
+
+#### 1.5. Verify the role was created and save its ARN
+
+```bash
+aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --query 'Role.Arn' \
+  --output text
+```
+
+Expected output: `arn:aws:iam::280785378630:role/patamu-purchases-db-backup--iam--role--execution`
+
+### Step 2: Create Task Role
+
+The **Task Role** grants permissions to the running container (e.g., uploading backups to S3).
+
+#### 2.1. Create the trust policy file
+
+The trust policy is the same as the execution role's.
+
+```bash
+cat > deploy-to-aws-ecs/task-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+
+#### 2.2. Create the task role
+
+```bash
+aws iam create-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --assume-role-policy-document file://deploy-to-aws-ecs/task-trust-policy.json
+```
+
+#### 2.3. Create the permissions policy file
+
+This policy allows the container to upload backup files to S3 and manage archives in Glacier (retrieve and delete old backups).
+
+```bash
+cat > deploy-to-aws-ecs/task-role-policy.json << 'EOF'
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:PutObjectAcl"
+            ],
+            "Resource": "arn:aws:s3:::patamu-purchases--resources/db-backups/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "s3:GetBucketLocation",
+            "Resource": "arn:aws:s3:::patamu-purchases--resources"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "glacier:DescribeVault",
+                "glacier:ListJobs",
+                "glacier:InitiateJob",
+                "glacier:DescribeJob",
+                "glacier:GetJobOutput",
+                "glacier:DeleteArchive"
+            ],
+            "Resource": "arn:aws:glacier:eu-central-1:280785378630:vaults/database-backups--purchases"
+        }
+    ]
+}
+EOF
+```
+
+#### 2.4. Attach the permissions policy to the role
+
+```bash
+aws iam put-role-policy \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --policy-name custom-task-policy \
+  --policy-document file://deploy-to-aws-ecs/task-role-policy.json
+```
+
+#### 2.5. Verify the role and save its ARN
+
+```bash
+aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --query 'Role.Arn' \
+  --output text
+```
+
+Expected output: `arn:aws:iam::280785378630:role/patamu-purchases-db-backup--iam--role--task`
+
+### Step 3: Create EventBridge Role
+
+The **EventBridge Role** allows EventBridge to trigger the ECS task on a schedule.
+
+#### 3.1. Store the role ARNs in variables
+
+These will be used in the EventBridge policy.
+
+```bash
+TASK_EXECUTION_ROLE_ARN=$(aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --query 'Role.Arn' \
+  --output text)
+
+TASK_ROLE_ARN=$(aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --query 'Role.Arn' \
+  --output text)
+
+echo "Task Execution Role ARN: $TASK_EXECUTION_ROLE_ARN"
+echo "Task Role ARN: $TASK_ROLE_ARN"
+```
+
+#### 3.2. Create the EventBridge trust policy file
+
+```bash
+cat > deploy-to-aws-ecs/eventbridge-trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+```
+
+#### 3.3. Create the EventBridge role
+
+```bash
+aws iam create-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--eventbridge \
+  --assume-role-policy-document file://deploy-to-aws-ecs/eventbridge-trust-policy.json
+```
+
+#### 3.4. Create the EventBridge permissions policy file
+
+This policy allows EventBridge to run the ECS task and pass the necessary roles.
+
+```bash
+cat > deploy-to-aws-ecs/eventbridge-role-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ecs:RunTask",
+      "Resource": "arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup:*",
+      "Condition": {
+        "ArnLike": {
+          "ecs:cluster": "arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "$TASK_EXECUTION_ROLE_ARN",
+        "$TASK_ROLE_ARN"
+      ],
+      "Condition": {
+        "StringLike": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+EOF
+```
+
+#### 3.5. Attach the permissions policy to the role
+
+```bash
+aws iam put-role-policy \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--eventbridge \
+  --policy-name custom-eventbridge-policy \
+  --policy-document file://deploy-to-aws-ecs/eventbridge-role-policy.json
+```
+
+#### 3.6. Verify the EventBridge role and save its ARN
+
+```bash
+EVENTBRIDGE_ROLE_ARN=$(aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--eventbridge \
+  --query 'Role.Arn' \
+  --output text)
+
+echo "EventBridge Role ARN: $EVENTBRIDGE_ROLE_ARN"
+```
+
+### Step 4: Create CloudWatch Log Group
+
+Create a log group for the container logs.
+
+```bash
+aws logs create-log-group \
+  --profile lluisaznar \
+  --log-group-name patamu-purchases--db-backup--container--php-cli--log-group \
+  --region eu-central-1
+```
+
+> **Note**: If the log group already exists, you'll see an error message. You can safely ignore it.
+
+### Step 5: Register ECS Task Definition
+
+#### 5.1. Create the task definition file
+
+This file defines the container configuration, resources, and roles.
+
+```bash
+cat > deploy-to-aws-ecs/task-definition.json << EOF
+{
+    "family": "patamu-purchases-db-backup",
+    "containerDefinitions": [
+        {
+            "name": "php",
+            "image": "280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-backup-php:production-202602130856-r0",
+            "memory": 1920,
+            "essential": true,
+            "environment": [
+                {
+                    "name": "ARTISAN_COMMAND",
+                    "value": "db-backup:create"
+                }
+            ],
+            "linuxParameters": {
+                "capabilities": {
+                    "drop": [
+                        "AUDIT_CONTROL",
+                        "BLOCK_SUSPEND",
+                        "CHOWN",
+                        "DAC_OVERRIDE",
+                        "DAC_READ_SEARCH",
+                        "FOWNER",
+                        "FSETID",
+                        "IPC_LOCK",
+                        "IPC_OWNER",
+                        "KILL",
+                        "LEASE",
+                        "LINUX_IMMUTABLE",
+                        "MAC_ADMIN",
+                        "MAC_OVERRIDE",
+                        "MKNOD",
+                        "NET_ADMIN",
+                        "NET_BIND_SERVICE",
+                        "NET_BROADCAST",
+                        "NET_RAW",
+                        "SETFCAP",
+                        "SETPCAP",
+                        "SYS_ADMIN",
+                        "SYS_BOOT",
+                        "SYS_CHROOT",
+                        "SYS_MODULE",
+                        "SYS_NICE",
+                        "SYS_PACCT",
+                        "SYS_PTRACE",
+                        "SYS_RAWIO",
+                        "SYS_RESOURCE",
+                        "SYS_TIME",
+                        "SYS_TTY_CONFIG",
+                        "SYSLOG",
+                        "WAKE_ALARM"
+                    ]
+                }
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "patamu-purchases--db-backup--container--php-cli--log-group",
+                    "awslogs-region": "eu-central-1",
+                    "awslogs-stream-prefix": "patamu-purchases--db-backup--container--php-cli"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "$TASK_ROLE_ARN",
+    "executionRoleArn": "$TASK_EXECUTION_ROLE_ARN",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "2048"
+}
+EOF
+```
+
+#### 5.2. Register the task definition
+
+```bash
+aws ecs register-task-definition \
+  --profile lluisaznar \
+  --cli-input-json file://deploy-to-aws-ecs/task-definition.json
+```
+
+#### 5.3. Save the task definition ARN
+
+```bash
+TASK_DEFINITION_ARN=$(aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text)
+
+echo "Task Definition ARN: $TASK_DEFINITION_ARN"
+```
+
+### Step 6: Create EventBridge Scheduled Rules
+
+We'll create two scheduled rules: one to create daily backups and another to delete old backups.
+
+#### 6.1. Create the backup creation schedule rule
+
+This creates a daily schedule to run the backup creation at 5 AM UTC.
+
+```bash
+aws events put-rule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup-create-schedule \
+  --schedule-expression "cron(0 5 * * ? *)" \
+  --description "Daily database backup creation at 5 AM UTC"
+```
+
+#### 6.2. Get network configuration from existing task (the one where the main Purchases web app is located)
+
+We'll reuse the network configuration (subnets and security groups) from an existing running task in the cluster.
+
+```bash
+# Get a running task ARN
+RUNNING_TASK_ARN=$(aws ecs list-tasks \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --desired-status RUNNING \
+  --query 'taskArns[0]' \
+  --output text)
+
+# Extract subnets
+SUBNETS_JSON=$(aws ecs describe-tasks \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --tasks $RUNNING_TASK_ARN \
+  --query 'tasks[0].attachments[0].details[?name==`subnetId`].value' \
+  --output json)
+
+# Get network interface ID
+ENI_ID=$(aws ecs describe-tasks \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --tasks $RUNNING_TASK_ARN \
+  --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value[0]' \
+  --output text)
+
+# Get all security groups with their names
+ALL_SGS_WITH_NAMES=$(aws ec2 describe-network-interfaces \
+  --profile lluisaznar \
+  --network-interface-ids $ENI_ID \
+  --query 'NetworkInterfaces[0].Groups[].[GroupId,GroupName]' \
+  --output json)
+
+# Filter out security groups containing "packagist" or "paypal" in the name
+SECURITY_GROUPS_JSON=$(echo $ALL_SGS_WITH_NAMES | jq '[.[] | select(.[1] | contains("packagist") or contains("paypal") | not) | .[0]]')
+
+echo "Subnets: $SUBNETS_JSON"
+echo "Security Groups: $SECURITY_GROUPS_JSON"
+```
+
+> **Note**: We filter out packagist and paypal security groups as they're only needed for the main application, not for the backup task.
+
+#### 6.3. Set the cluster ARN
+
+```bash
+CLUSTER_ARN="arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster"
+```
+
+#### 6.4. Create the backup creation targets file
+
+This configures EventBridge to run the backup creation task with the proper network configuration.
+
+```bash
+cat > deploy-to-aws-ecs/eventbridge-create-targets.json << EOF
+[
+  {
+    "Id": "1",
+    "Arn": "$CLUSTER_ARN",
+    "RoleArn": "$EVENTBRIDGE_ROLE_ARN",
+    "EcsParameters": {
+      "TaskDefinitionArn": "$TASK_DEFINITION_ARN",
+      "LaunchType": "FARGATE",
+      "NetworkConfiguration": {
+        "awsvpcConfiguration": {
+          "Subnets": $SUBNETS_JSON,
+          "SecurityGroups": $SECURITY_GROUPS_JSON,
+          "AssignPublicIp": "DISABLED"
+        }
+      }
+    }
+  }
+]
+EOF
+```
+
+#### 6.5. Add the backup creation task as a target to the EventBridge rule
+
+```bash
+aws events put-targets \
+  --profile lluisaznar \
+  --rule patamu-purchases-db-backup-create-schedule \
+  --targets file://deploy-to-aws-ecs/eventbridge-create-targets.json
+```
+
+#### 6.6. Create the backup deletion schedule rule
+
+This creates a weekly schedule to delete old backups every Sunday at 6 AM UTC.
+
+```bash
+aws events put-rule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup-delete-schedule \
+  --schedule-expression "cron(0 6 ? * SUN *)" \
+  --description "Weekly database backup cleanup on Sundays at 6 AM UTC"
+```
+
+#### 6.7. Create the backup deletion targets file
+
+This configures EventBridge to run the same task definition but overrides the `ARTISAN_COMMAND` environment variable to execute the delete command.
+
+```bash
+cat > deploy-to-aws-ecs/eventbridge-delete-targets.json << EOF
+[
+  {
+    "Id": "1",
+    "Arn": "$CLUSTER_ARN",
+    "RoleArn": "$EVENTBRIDGE_ROLE_ARN",
+    "EcsParameters": {
+      "TaskDefinitionArn": "$TASK_DEFINITION_ARN",
+      "LaunchType": "FARGATE",
+      "NetworkConfiguration": {
+        "awsvpcConfiguration": {
+          "Subnets": $SUBNETS_JSON,
+          "SecurityGroups": $SECURITY_GROUPS_JSON,
+          "AssignPublicIp": "DISABLED"
+        }
+      },
+      "TaskCount": 1,
+      "Overrides": {
+        "ContainerOverrides": [
+          {
+            "Name": "php",
+            "Environment": [
+              {
+                "Name": "ARTISAN_COMMAND",
+                "Value": "db-backup:delete"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+]
+EOF
+```
+
+> **Note**: The `Overrides` section allows us to change the environment variable at runtime, so the same task definition can run different artisan commands.
+
+#### 6.8. Add the backup deletion task as a target to the EventBridge rule
+
+```bash
+aws events put-targets \
+  --profile lluisaznar \
+  --rule patamu-purchases-db-backup-delete-schedule \
+  --targets file://deploy-to-aws-ecs/eventbridge-delete-targets.json
+```
+
+### Step 7: Verification
+
+#### 7.1. Verify all IAM roles exist
+
+```bash
+echo "=== Verifying IAM Roles ==="
+aws iam get-role --profile lluisaznar --role-name patamu-purchases-db-backup--iam--role--task --query 'Role.RoleName' --output text
+aws iam get-role --profile lluisaznar --role-name patamu-purchases-db-backup--iam--role--execution --query 'Role.RoleName' --output text
+aws iam get-role --profile lluisaznar --role-name patamu-purchases-db-backup--iam--role--eventbridge --query 'Role.RoleName' --output text
+```
+
+Expected output:
+
+```text
+=== Verifying IAM Roles ===
+patamu-purchases-db-backup--iam--role--task
+patamu-purchases-db-backup--iam--role--execution
+patamu-purchases-db-backup--iam--role--eventbridge
+```
+
+#### 7.2. Verify the task definition
+
+```bash
+aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup \
+  --query 'taskDefinition.{Family:family,Revision:revision,Status:status}' \
+  --output table
+```
+
+#### 7.3. Verify the EventBridge rules and their targets
+
+```bash
+echo "=== Backup Creation Rule ==="
+aws events describe-rule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup-create-schedule \
+  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description}' \
+  --output table
+
+echo ""
+echo "=== Backup Creation Targets ==="
+aws events list-targets-by-rule \
+  --profile lluisaznar \
+  --rule patamu-purchases-db-backup-create-schedule \
+  --query 'Targets[0].{Id:Id,EcsTaskDef:EcsParameters.TaskDefinitionArn}' \
+  --output table
+
+echo ""
+echo "=== Backup Deletion Rule ==="
+aws events describe-rule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup-delete-schedule \
+  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description}' \
+  --output table
+
+echo ""
+echo "=== Backup Deletion Targets ==="
+aws events list-targets-by-rule \
+  --profile lluisaznar \
+  --rule patamu-purchases-db-backup-delete-schedule \
+  --query 'Targets[0].{Id:Id,EcsTaskDef:EcsParameters.TaskDefinitionArn,Command:EcsParameters.Overrides.ContainerOverrides[0].Environment[0].Value}' \
+  --output table
+```
+
+#### 7.4. Manually test the backup tasks
+
+You can manually run both tasks to test them before waiting for the schedules:
+
+**Test backup creation:**
+
+```bash
+aws ecs run-task \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --task-definition patamu-purchases-db-backup \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=$SUBNETS_JSON,securityGroups=$SECURITY_GROUPS_JSON,assignPublicIp=DISABLED}"
+```
+
+**Test backup deletion:**
+
+```bash
+aws ecs run-task \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --task-definition patamu-purchases-db-backup \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=$SUBNETS_JSON,securityGroups=$SECURITY_GROUPS_JSON,assignPublicIp=DISABLED}" \
+  --overrides '{"containerOverrides":[{"name":"php","environment":[{"name":"ARTISAN_COMMAND","value":"db-backup:delete"}]}]}'
+```
+
+#### 7.5. Check the task logs
+
+After the task runs, check CloudWatch Logs:
+
+```bash
+aws logs tail \
+  --profile lluisaznar \
+  --follow \
+  patamu-purchases--db-backup--container--php-cli--log-group
+```
+
+> **Success!** Your scheduled database backup tasks are now configured:
+>
+> - Backups will be created daily at 5 AM UTC
+> - Old backups will be deleted weekly on Sundays at 6 AM UTC
 
 ## **Hints**
 
