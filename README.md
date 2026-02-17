@@ -36,23 +36,20 @@ This is the **Docker** image of the tiny Laravel app that is used to do database
       - [3.5. Attach the permissions policy to the role](#35-attach-the-permissions-policy-to-the-role)
       - [3.6. Verify the EventBridge role and save its ARN](#36-verify-the-eventbridge-role-and-save-its-arn)
     - [Step 4: Create CloudWatch Log Group](#step-4-create-cloudwatch-log-group)
-    - [Step 5: Register ECS Task Definition](#step-5-register-ecs-task-definition)
-      - [5.1. Create the task definition file](#51-create-the-task-definition-file)
-      - [5.2. Register the task definition](#52-register-the-task-definition)
-      - [5.3. Save the task definition ARN](#53-save-the-task-definition-arn)
-    - [Step 6: Create EventBridge Scheduled Rules](#step-6-create-eventbridge-scheduled-rules)
-      - [6.1. Create the backup creation schedule rule](#61-create-the-backup-creation-schedule-rule)
-      - [6.2. Get network configuration from existing task (the one where the main Purchases web app is located)](#62-get-network-configuration-from-existing-task-the-one-where-the-main-purchases-web-app-is-located)
-      - [6.3. Set the cluster ARN](#63-set-the-cluster-arn)
-      - [6.4. Create the backup creation targets file](#64-create-the-backup-creation-targets-file)
-      - [6.5. Add the backup creation task as a target to the EventBridge rule](#65-add-the-backup-creation-task-as-a-target-to-the-eventbridge-rule)
-      - [6.6. Create the backup deletion schedule rule](#66-create-the-backup-deletion-schedule-rule)
-      - [6.7. Create the backup deletion targets file](#67-create-the-backup-deletion-targets-file)
-      - [6.8. Add the backup deletion task as a target to the EventBridge rule](#68-add-the-backup-deletion-task-as-a-target-to-the-eventbridge-rule)
+    - [Step 5: Register ECS Task Definitions](#step-5-register-ecs-task-definitions)
+      - [5.1. Create the backup creation task definition file](#51-create-the-backup-creation-task-definition-file)
+      - [5.2. Register the backup creation task definition](#52-register-the-backup-creation-task-definition)
+      - [5.3. Create the backup deletion task definition file](#53-create-the-backup-deletion-task-definition-file)
+      - [5.4. Register the backup deletion task definition](#54-register-the-backup-deletion-task-definition)
+      - [5.5. Save both task definition ARNs](#55-save-both-task-definition-arns)
+    - [Step 6: Create EventBridge Schedules](#step-6-create-eventbridge-schedules)
+      - [6.1. Set network configuration variables](#61-set-network-configuration-variables)
+      - [6.2. Create the backup creation schedule](#62-create-the-backup-creation-schedule)
+      - [6.3. Create the backup deletion schedule](#63-create-the-backup-deletion-schedule)
     - [Step 7: Verification](#step-7-verification)
       - [7.1. Verify all IAM roles exist](#71-verify-all-iam-roles-exist)
-      - [7.2. Verify the task definition](#72-verify-the-task-definition)
-      - [7.3. Verify the EventBridge rules and their targets](#73-verify-the-eventbridge-rules-and-their-targets)
+      - [7.2. Verify the task definitions](#72-verify-the-task-definitions)
+      - [7.3. Verify the EventBridge schedules](#73-verify-the-eventbridge-schedules)
       - [7.4. Manually test the backup tasks](#74-manually-test-the-backup-tasks)
       - [7.5. Check the task logs](#75-check-the-task-logs)
   - [**Hints**](#hints)
@@ -422,7 +419,7 @@ cat > deploy-to-aws-ecs/eventbridge-trust-policy.json << 'EOF'
     {
       "Effect": "Allow",
       "Principal": {
-        "Service": "events.amazonaws.com"
+        "Service": "scheduler.amazonaws.com"
       },
       "Action": "sts:AssumeRole"
     }
@@ -452,7 +449,10 @@ cat > deploy-to-aws-ecs/eventbridge-role-policy.json << EOF
     {
       "Effect": "Allow",
       "Action": "ecs:RunTask",
-      "Resource": "arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup:*",
+      "Resource": [
+        "arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup-create:*",
+        "arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup-delete:*"
+      ],
       "Condition": {
         "ArnLike": {
           "ecs:cluster": "arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster"
@@ -512,20 +512,22 @@ aws logs create-log-group \
 
 > **Note**: If the log group already exists, you'll see an error message. You can safely ignore it.
 
-### Step 5: Register ECS Task Definition
+### Step 5: Register ECS Task Definitions
 
-#### 5.1. Create the task definition file
+We'll create two task definitions: one for backup creation and one for backup deletion.
 
-This file defines the container configuration, resources, and roles.
+#### 5.1. Create the backup creation task definition file
+
+This file defines the container configuration for creating backups.
 
 ```bash
-cat > deploy-to-aws-ecs/task-definition.json << EOF
+cat > deploy-to-aws-ecs/task-definition-create.json << EOF
 {
-    "family": "patamu-purchases-db-backup",
+    "family": "patamu-purchases-db-backup-create",
     "containerDefinitions": [
         {
             "name": "php",
-            "image": "280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-backup-php:production-202602130856-r0",
+            "image": "280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-backup-php:production-202602130856-r1",
             "memory": 1920,
             "essential": true,
             "environment": [
@@ -596,191 +598,211 @@ cat > deploy-to-aws-ecs/task-definition.json << EOF
 EOF
 ```
 
-#### 5.2. Register the task definition
+#### 5.2. Register the backup creation task definition
 
 ```bash
 aws ecs register-task-definition \
   --profile lluisaznar \
-  --cli-input-json file://deploy-to-aws-ecs/task-definition.json
+  --cli-input-json file://deploy-to-aws-ecs/task-definition-create.json
 ```
 
-#### 5.3. Save the task definition ARN
+#### 5.3. Create the backup deletion task definition file
+
+This file is identical except it runs the `db-backup:delete` command.
 
 ```bash
-TASK_DEFINITION_ARN=$(aws ecs describe-task-definition \
+cat > deploy-to-aws-ecs/task-definition-delete.json << EOF
+{
+    "family": "patamu-purchases-db-backup-delete",
+    "containerDefinitions": [
+        {
+            "name": "php",
+            "image": "280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-backup-php:production-202602130856-r1",
+            "memory": 1920,
+            "essential": true,
+            "environment": [
+                {
+                    "name": "ARTISAN_COMMAND",
+                    "value": "db-backup:delete"
+                }
+            ],
+            "linuxParameters": {
+                "capabilities": {
+                    "drop": [
+                        "AUDIT_CONTROL",
+                        "BLOCK_SUSPEND",
+                        "CHOWN",
+                        "DAC_OVERRIDE",
+                        "DAC_READ_SEARCH",
+                        "FOWNER",
+                        "FSETID",
+                        "IPC_LOCK",
+                        "IPC_OWNER",
+                        "KILL",
+                        "LEASE",
+                        "LINUX_IMMUTABLE",
+                        "MAC_ADMIN",
+                        "MAC_OVERRIDE",
+                        "MKNOD",
+                        "NET_ADMIN",
+                        "NET_BIND_SERVICE",
+                        "NET_BROADCAST",
+                        "NET_RAW",
+                        "SETFCAP",
+                        "SETPCAP",
+                        "SYS_ADMIN",
+                        "SYS_BOOT",
+                        "SYS_CHROOT",
+                        "SYS_MODULE",
+                        "SYS_NICE",
+                        "SYS_PACCT",
+                        "SYS_PTRACE",
+                        "SYS_RAWIO",
+                        "SYS_RESOURCE",
+                        "SYS_TIME",
+                        "SYS_TTY_CONFIG",
+                        "SYSLOG",
+                        "WAKE_ALARM"
+                    ]
+                }
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "patamu-purchases--db-backup--container--php-cli--log-group",
+                    "awslogs-region": "eu-central-1",
+                    "awslogs-stream-prefix": "patamu-purchases--db-backup--container--php-cli"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "$TASK_ROLE_ARN",
+    "executionRoleArn": "$TASK_EXECUTION_ROLE_ARN",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "2048"
+}
+EOF
+```
+
+#### 5.4. Register the backup deletion task definition
+
+```bash
+aws ecs register-task-definition \
   --profile lluisaznar \
-  --task-definition patamu-purchases-db-backup \
+  --cli-input-json file://deploy-to-aws-ecs/task-definition-delete.json
+```
+
+#### 5.5. Save both task definition ARNs
+
+```bash
+TASK_DEFINITION_CREATE_ARN=$(aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup-create \
   --query 'taskDefinition.taskDefinitionArn' \
   --output text)
 
-echo "Task Definition ARN: $TASK_DEFINITION_ARN"
+TASK_DEFINITION_DELETE_ARN=$(aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup-delete \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text)
+
+echo "Create Task Definition ARN: $TASK_DEFINITION_CREATE_ARN"
+echo "Delete Task Definition ARN: $TASK_DEFINITION_DELETE_ARN"
 ```
 
-### Step 6: Create EventBridge Scheduled Rules
+### Step 6: Create EventBridge Schedules
 
-We'll create two scheduled rules: one to create daily backups and another to delete old backups.
+We'll create two schedules using EventBridge Scheduler (the modern approach): one to create daily backups and another to delete old backups.
 
-#### 6.1. Create the backup creation schedule rule
+#### 6.1. Set network configuration variables
+
+We'll reuse the network configuration (subnets and security groups) from the existing patamu-purchases ECS service.
+
+**To find these values in the AWS Console:**
+
+1. Navigate to **ECS** → **Clusters** → **patamu-purchases--cluster**
+2. Click on the **patamu-purchases--fargate-service** service
+3. Go to the **Configuration and networking** tab
+4. Under **Network configuration**, you'll find:
+   - **Subnets**: Copy the subnet IDs (they look like `subnet-xxxxxxxxx`)
+   - **Security groups**: Copy the security group IDs (they look like `sg-xxxxxxxxx`)
+
+   > **Note**: Only copy security groups needed for database access and basic networking. Exclude security groups specific to the main application (like packagist or paypal).
+
+**Set the environment variables:**
+
+```bash
+# Set subnets as comma-separated values (replace with your actual subnet IDs)
+SUBNETS="subnet-0425fdfb5541b7a9c,subnet-092dd5929001c7a12"
+
+# Set security groups as comma-separated values (replace with your actual security group IDs)
+SECURITY_GROUPS="sg-08ccd68bb58faa5f3,sg-023f4f99f90f9e3d6,sg-0ba7bab5f6f64d623"
+
+echo "Subnets: $SUBNETS"
+echo "Security Groups: $SECURITY_GROUPS"
+```
+
+#### 6.2. Create the backup creation schedule
 
 This creates a daily schedule to run the backup creation at 5 AM UTC.
 
 ```bash
-aws events put-rule \
+aws scheduler create-schedule \
   --profile lluisaznar \
-  --name patamu-purchases-db-backup-create-schedule \
+  --name patamu-purchases-db-backup--event--create \
   --schedule-expression "cron(0 5 * * ? *)" \
-  --description "Daily database backup creation at 5 AM UTC"
-```
-
-#### 6.2. Get network configuration from existing task (the one where the main Purchases web app is located)
-
-We'll reuse the network configuration (subnets and security groups) from an existing running task in the cluster.
-
-```bash
-# Get a running task ARN
-RUNNING_TASK_ARN=$(aws ecs list-tasks \
-  --profile lluisaznar \
-  --cluster patamu-purchases--cluster \
-  --desired-status RUNNING \
-  --query 'taskArns[0]' \
-  --output text)
-
-# Extract subnets
-SUBNETS_JSON=$(aws ecs describe-tasks \
-  --profile lluisaznar \
-  --cluster patamu-purchases--cluster \
-  --tasks $RUNNING_TASK_ARN \
-  --query 'tasks[0].attachments[0].details[?name==`subnetId`].value' \
-  --output json)
-
-# Get network interface ID
-ENI_ID=$(aws ecs describe-tasks \
-  --profile lluisaznar \
-  --cluster patamu-purchases--cluster \
-  --tasks $RUNNING_TASK_ARN \
-  --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value[0]' \
-  --output text)
-
-# Get all security groups with their names
-ALL_SGS_WITH_NAMES=$(aws ec2 describe-network-interfaces \
-  --profile lluisaznar \
-  --network-interface-ids $ENI_ID \
-  --query 'NetworkInterfaces[0].Groups[].[GroupId,GroupName]' \
-  --output json)
-
-# Filter out security groups containing "packagist" or "paypal" in the name
-SECURITY_GROUPS_JSON=$(echo $ALL_SGS_WITH_NAMES | jq '[.[] | select(.[1] | contains("packagist") or contains("paypal") | not) | .[0]]')
-
-echo "Subnets: $SUBNETS_JSON"
-echo "Security Groups: $SECURITY_GROUPS_JSON"
-```
-
-> **Note**: We filter out packagist and paypal security groups as they're only needed for the main application, not for the backup task.
-
-#### 6.3. Set the cluster ARN
-
-```bash
-CLUSTER_ARN="arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster"
-```
-
-#### 6.4. Create the backup creation targets file
-
-This configures EventBridge to run the backup creation task with the proper network configuration.
-
-```bash
-cat > deploy-to-aws-ecs/eventbridge-create-targets.json << EOF
-[
-  {
-    "Id": "1",
-    "Arn": "$CLUSTER_ARN",
-    "RoleArn": "$EVENTBRIDGE_ROLE_ARN",
-    "EcsParameters": {
-      "TaskDefinitionArn": "$TASK_DEFINITION_ARN",
-      "LaunchType": "FARGATE",
-      "NetworkConfiguration": {
-        "awsvpcConfiguration": {
-          "Subnets": $SUBNETS_JSON,
-          "SecurityGroups": $SECURITY_GROUPS_JSON,
-          "AssignPublicIp": "DISABLED"
+  --schedule-expression-timezone "UTC" \
+  --description "Daily database backup creation at 5 AM UTC" \
+  --flexible-time-window Mode=OFF \
+  --target "{
+    \"Arn\": \"arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster\",
+    \"RoleArn\": \"$EVENTBRIDGE_ROLE_ARN\",
+    \"EcsParameters\": {
+      \"TaskDefinitionArn\": \"$TASK_DEFINITION_CREATE_ARN\",
+      \"LaunchType\": \"FARGATE\",
+      \"NetworkConfiguration\": {
+        \"awsvpcConfiguration\": {
+          \"Subnets\": [\"$SUBNETS\"],
+          \"SecurityGroups\": [\"$SECURITY_GROUPS\"],
+          \"AssignPublicIp\": \"DISABLED\"
         }
       }
     }
-  }
-]
-EOF
+  }"
 ```
 
-#### 6.5. Add the backup creation task as a target to the EventBridge rule
-
-```bash
-aws events put-targets \
-  --profile lluisaznar \
-  --rule patamu-purchases-db-backup-create-schedule \
-  --targets file://deploy-to-aws-ecs/eventbridge-create-targets.json
-```
-
-#### 6.6. Create the backup deletion schedule rule
+#### 6.3. Create the backup deletion schedule
 
 This creates a weekly schedule to delete old backups every Sunday at 6 AM UTC.
 
 ```bash
-aws events put-rule \
+aws scheduler create-schedule \
   --profile lluisaznar \
-  --name patamu-purchases-db-backup-delete-schedule \
+  --name patamu-purchases-db-backup--event--delete \
   --schedule-expression "cron(0 6 ? * SUN *)" \
-  --description "Weekly database backup cleanup on Sundays at 6 AM UTC"
-```
-
-#### 6.7. Create the backup deletion targets file
-
-This configures EventBridge to run the same task definition but overrides the `ARTISAN_COMMAND` environment variable to execute the delete command.
-
-```bash
-cat > deploy-to-aws-ecs/eventbridge-delete-targets.json << EOF
-[
-  {
-    "Id": "1",
-    "Arn": "$CLUSTER_ARN",
-    "RoleArn": "$EVENTBRIDGE_ROLE_ARN",
-    "EcsParameters": {
-      "TaskDefinitionArn": "$TASK_DEFINITION_ARN",
-      "LaunchType": "FARGATE",
-      "NetworkConfiguration": {
-        "awsvpcConfiguration": {
-          "Subnets": $SUBNETS_JSON,
-          "SecurityGroups": $SECURITY_GROUPS_JSON,
-          "AssignPublicIp": "DISABLED"
+  --schedule-expression-timezone "UTC" \
+  --description "Weekly database backup cleanup on Sundays at 6 AM UTC" \
+  --flexible-time-window Mode=OFF \
+  --target "{
+    \"Arn\": \"arn:aws:ecs:eu-central-1:280785378630:cluster/patamu-purchases--cluster\",
+    \"RoleArn\": \"$EVENTBRIDGE_ROLE_ARN\",
+    \"EcsParameters\": {
+      \"TaskDefinitionArn\": \"$TASK_DEFINITION_DELETE_ARN\",
+      \"LaunchType\": \"FARGATE\",
+      \"NetworkConfiguration\": {
+        \"awsvpcConfiguration\": {
+          \"Subnets\": [\"$SUBNETS\"],
+          \"SecurityGroups\": [\"$SECURITY_GROUPS\"],
+          \"AssignPublicIp\": \"DISABLED\"
         }
-      },
-      "TaskCount": 1,
-      "Overrides": {
-        "ContainerOverrides": [
-          {
-            "Name": "php",
-            "Environment": [
-              {
-                "Name": "ARTISAN_COMMAND",
-                "Value": "db-backup:delete"
-              }
-            ]
-          }
-        ]
       }
     }
-  }
-]
-EOF
-```
-
-> **Note**: The `Overrides` section allows us to change the environment variable at runtime, so the same task definition can run different artisan commands.
-
-#### 6.8. Add the backup deletion task as a target to the EventBridge rule
-
-```bash
-aws events put-targets \
-  --profile lluisaznar \
-  --rule patamu-purchases-db-backup-delete-schedule \
-  --targets file://deploy-to-aws-ecs/eventbridge-delete-targets.json
+  }"
 ```
 
 ### Step 7: Verification
@@ -803,48 +825,41 @@ patamu-purchases-db-backup--iam--role--execution
 patamu-purchases-db-backup--iam--role--eventbridge
 ```
 
-#### 7.2. Verify the task definition
+#### 7.2. Verify the task definitions
 
 ```bash
+echo "=== Backup Creation Task Definition ==="
 aws ecs describe-task-definition \
   --profile lluisaznar \
-  --task-definition patamu-purchases-db-backup \
+  --task-definition patamu-purchases-db-backup-create \
+  --query 'taskDefinition.{Family:family,Revision:revision,Status:status}' \
+  --output table
+
+echo ""
+echo "=== Backup Deletion Task Definition ==="
+aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup-delete \
   --query 'taskDefinition.{Family:family,Revision:revision,Status:status}' \
   --output table
 ```
 
-#### 7.3. Verify the EventBridge rules and their targets
+#### 7.3. Verify the EventBridge schedules
 
 ```bash
-echo "=== Backup Creation Rule ==="
-aws events describe-rule \
+echo "=== Backup Creation Schedule ==="
+aws scheduler get-schedule \
   --profile lluisaznar \
-  --name patamu-purchases-db-backup-create-schedule \
-  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description}' \
+  --name patamu-purchases-db-backup--event--create \
+  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description,TaskDef:Target.EcsParameters.TaskDefinitionArn}' \
   --output table
 
 echo ""
-echo "=== Backup Creation Targets ==="
-aws events list-targets-by-rule \
+echo "=== Backup Deletion Schedule ==="
+aws scheduler get-schedule \
   --profile lluisaznar \
-  --rule patamu-purchases-db-backup-create-schedule \
-  --query 'Targets[0].{Id:Id,EcsTaskDef:EcsParameters.TaskDefinitionArn}' \
-  --output table
-
-echo ""
-echo "=== Backup Deletion Rule ==="
-aws events describe-rule \
-  --profile lluisaznar \
-  --name patamu-purchases-db-backup-delete-schedule \
-  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description}' \
-  --output table
-
-echo ""
-echo "=== Backup Deletion Targets ==="
-aws events list-targets-by-rule \
-  --profile lluisaznar \
-  --rule patamu-purchases-db-backup-delete-schedule \
-  --query 'Targets[0].{Id:Id,EcsTaskDef:EcsParameters.TaskDefinitionArn,Command:EcsParameters.Overrides.ContainerOverrides[0].Environment[0].Value}' \
+  --name patamu-purchases-db-backup--event--delete \
+  --query '{Name:Name,State:State,Schedule:ScheduleExpression,Description:Description,TaskDef:Target.EcsParameters.TaskDefinitionArn}' \
   --output table
 ```
 
@@ -858,9 +873,9 @@ You can manually run both tasks to test them before waiting for the schedules:
 aws ecs run-task \
   --profile lluisaznar \
   --cluster patamu-purchases--cluster \
-  --task-definition patamu-purchases-db-backup \
+  --task-definition patamu-purchases-db-backup-create \
   --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=$SUBNETS_JSON,securityGroups=$SECURITY_GROUPS_JSON,assignPublicIp=DISABLED}"
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=DISABLED}"
 ```
 
 **Test backup deletion:**
@@ -869,10 +884,9 @@ aws ecs run-task \
 aws ecs run-task \
   --profile lluisaznar \
   --cluster patamu-purchases--cluster \
-  --task-definition patamu-purchases-db-backup \
+  --task-definition patamu-purchases-db-backup-delete \
   --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=$SUBNETS_JSON,securityGroups=$SECURITY_GROUPS_JSON,assignPublicIp=DISABLED}" \
-  --overrides '{"containerOverrides":[{"name":"php","environment":[{"name":"ARTISAN_COMMAND","value":"db-backup:delete"}]}]}'
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=DISABLED}"
 ```
 
 #### 7.5. Check the task logs
