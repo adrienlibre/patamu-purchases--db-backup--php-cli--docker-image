@@ -15,7 +15,12 @@ This is the **Docker** image of the tiny Laravel app that is used to do database
     - [Build](#build)
     - [Push](#push)
     - [Document the tag changes on UPGRADES.md](#document-the-tag-changes-on-upgradesmd)
+  - [Loading AWS Environment Variables](#loading-aws-environment-variables)
+    - [Usage](#usage)
+    - [What it does](#what-it-does)
+    - [Example output](#example-output)
   - [Deploy ECS Service for Database Backup](#deploy-ecs-service-for-database-backup)
+    - [Step 0: Create Environment Variables Helper Script](#step-0-create-environment-variables-helper-script)
     - [Step 1: Create Task Execution Role](#step-1-create-task-execution-role)
       - [1.1. Create the trust policy file](#11-create-the-trust-policy-file)
       - [1.2. Create the execution role](#12-create-the-execution-role)
@@ -52,6 +57,17 @@ This is the **Docker** image of the tiny Laravel app that is used to do database
       - [7.3. Verify the EventBridge schedules](#73-verify-the-eventbridge-schedules)
       - [7.4. Manually test the backup tasks](#74-manually-test-the-backup-tasks)
       - [7.5. Check the task logs](#75-check-the-task-logs)
+  - [Update ECS Task Definitions for New Image Releases](#update-ecs-task-definitions-for-new-image-releases)
+    - [Step 1: Verify the New Image in ECR](#step-1-verify-the-new-image-in-ecr)
+    - [Step 2: Store Role ARNs in Variables](#step-2-store-role-arns-in-variables)
+    - [Step 3: Update Backup Creation Task Definition](#step-3-update-backup-creation-task-definition)
+    - [Step 4: Register the Updated Backup Creation Task Definition](#step-4-register-the-updated-backup-creation-task-definition)
+    - [Step 5: Update Backup Deletion Task Definition](#step-5-update-backup-deletion-task-definition)
+    - [Step 6: Register the Updated Backup Deletion Task Definition](#step-6-register-the-updated-backup-deletion-task-definition)
+    - [Step 7: Verify the New Task Definitions](#step-7-verify-the-new-task-definitions)
+    - [Step 8: Test the New Task Definitions](#step-8-test-the-new-task-definitions)
+    - [Step 9: Monitor the Test Task Logs](#step-9-monitor-the-test-task-logs)
+    - [Step 10: Verify EventBridge Schedules](#step-10-verify-eventbridge-schedules)
   - [**Hints**](#hints)
     - [Using Private ECR Registry instead of Docker Hub](#using-private-ecr-registry-instead-of-docker-hub)
     - [Using Private ECR Registry for local development](#using-private-ecr-registry-for-local-development)
@@ -186,11 +202,178 @@ docker push 280785378630.dkr.ecr.eu-central-1.amazonaws.com/patamu-purchases-db-
 
 It's important to keep track of the evolution of the project. Everytime a new version is released, we should document the related tag and the changes it involves on the file `UPGRADES.md`.
 
+## Loading AWS Environment Variables
+
+The deployment and update procedures require several environment variables (IAM role ARNs, task definition ARNs, network configuration, etc.). Instead of manually exporting these variables every time you open a new terminal session, you can use the `load-aws-env.sh` script located in the `deploy-to-aws-ecs/` directory.
+
+> **Note**: This script is created in [Step 0](#step-0-create-environment-variables-helper-script) of the deployment process.
+
+### Usage
+
+Source the script to load all environment variables into your current shell session:
+
+```bash
+source deploy-to-aws-ecs/load-aws-env.sh
+```
+
+Or alternatively:
+
+```bash
+. deploy-to-aws-ecs/load-aws-env.sh
+```
+
+### What it does
+
+The script automatically:
+
+1. Retrieves all IAM role ARNs (task execution, task, and EventBridge roles)
+2. Retrieves the latest task definition ARNs for both create and delete tasks
+3. Sets the network configuration (subnets and security groups)
+4. Exports all variables so they're available for subsequent AWS CLI commands
+5. Displays a summary of loaded variables and warns if any are missing
+
+### Example output
+
+```text
+Loading AWS environment variables...
+  Using AWS profile: lluisaznar
+  Retrieving IAM role ARNs...
+  Retrieving task definition ARNs...
+
+Environment variables loaded:
+  TASK_EXECUTION_ROLE_ARN: arn:aws:iam::280785378630:role/patamu-purchases-db-backup--iam--role--execution
+  TASK_ROLE_ARN: arn:aws:iam::280785378630:role/patamu-purchases-db-backup--iam--role--task
+  EVENTBRIDGE_ROLE_ARN: arn:aws:iam::280785378630:role/patamu-purchases-db-backup--iam--role--eventbridge
+  TASK_DEFINITION_CREATE_ARN: arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup-create:2
+  TASK_DEFINITION_DELETE_ARN: arn:aws:ecs:eu-central-1:280785378630:task-definition/patamu-purchases-db-backup-delete:2
+  SUBNETS: subnet-0425fdfb5541b7a9c,subnet-092dd5929001c7a12
+  SECURITY_GROUPS: sg-08ccd68bb58faa5f3,sg-023f4f99f90f9e3d6,sg-0ba7bab5f6f64d623
+
+✓ All environment variables loaded successfully!
+```
+
+> **Tip**: Add `source deploy-to-aws-ecs/load-aws-env.sh` to your shell's startup file (e.g., `~/.bashrc`) if you work with this project frequently, or create an alias like `alias load-db-backup-env='source ~/path/to/patamu-purchases--db-backup--php-cli--docker-image/deploy-to-aws-ecs/load-aws-env.sh'`.
+
 ## Deploy ECS Service for Database Backup
 
 This section provides a complete step-by-step guide to deploy scheduled **ECS Fargate** tasks using **AWS CLI**. We'll create two EventBridge schedules: one to run daily for creating database backups, and another to run weekly for deleting old backups. We'll set up the necessary IAM roles, task definition, and EventBridge schedulers.
 
 > **Prerequisites**: Ensure you have the Docker image built and pushed to ECR, and that you're working from the project root directory.
+>
+> **Note**: For steps that require environment variables, you can manually export them as shown in each step, or use the [load-aws-env.sh](#loading-aws-environment-variables) script to load them all at once.
+
+### Step 0: Create Environment Variables Helper Script
+
+Before starting the deployment, create a helper script that will make it easy to load all necessary environment variables in future terminal sessions.
+
+```bash
+cat > deploy-to-aws-ecs/load-aws-env.sh << 'EOF'
+#!/bin/bash
+
+# Load AWS Environment Variables for patamu-purchases Database Backup
+# Usage: source deploy-to-aws-ecs/load-aws-env.sh
+#
+# This script retrieves and exports all necessary environment variables
+# for managing the ECS database backup tasks and schedules.
+
+set -e
+
+echo "Loading AWS environment variables..."
+
+# AWS Profile
+export AWS_PROFILE="${AWS_PROFILE:-lluisaznar}"
+echo "  Using AWS profile: $AWS_PROFILE"
+
+# IAM Role ARNs
+echo "  Retrieving IAM role ARNs..."
+export TASK_EXECUTION_ROLE_ARN=$(aws iam get-role \
+  --profile $AWS_PROFILE \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --query 'Role.Arn' \
+  --output text 2>/dev/null || echo "")
+
+export TASK_ROLE_ARN=$(aws iam get-role \
+  --profile $AWS_PROFILE \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --query 'Role.Arn' \
+  --output text 2>/dev/null || echo "")
+
+export EVENTBRIDGE_ROLE_ARN=$(aws iam get-role \
+  --profile $AWS_PROFILE \
+  --role-name patamu-purchases-db-backup--iam--role--eventbridge \
+  --query 'Role.Arn' \
+  --output text 2>/dev/null || echo "")
+
+# Task Definition ARNs
+echo "  Retrieving task definition ARNs..."
+export TASK_DEFINITION_CREATE_ARN=$(aws ecs describe-task-definition \
+  --profile $AWS_PROFILE \
+  --task-definition patamu-purchases-db-backup-create \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text 2>/dev/null || echo "")
+
+export TASK_DEFINITION_DELETE_ARN=$(aws ecs describe-task-definition \
+  --profile $AWS_PROFILE \
+  --task-definition patamu-purchases-db-backup-delete \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text 2>/dev/null || echo "")
+
+# Network Configuration
+# These are fixed values based on the patamu-purchases ECS service configuration
+export SUBNETS="subnet-0425fdfb5541b7a9c,subnet-092dd5929001c7a12"
+export SECURITY_GROUPS="sg-08ccd68bb58faa5f3,sg-023f4f99f90f9e3d6,sg-0ba7bab5f6f64d623"
+
+# Verification
+echo ""
+echo "Environment variables loaded:"
+echo "  TASK_EXECUTION_ROLE_ARN: ${TASK_EXECUTION_ROLE_ARN:-[NOT FOUND]}"
+echo "  TASK_ROLE_ARN: ${TASK_ROLE_ARN:-[NOT FOUND]}"
+echo "  EVENTBRIDGE_ROLE_ARN: ${EVENTBRIDGE_ROLE_ARN:-[NOT FOUND]}"
+echo "  TASK_DEFINITION_CREATE_ARN: ${TASK_DEFINITION_CREATE_ARN:-[NOT FOUND]}"
+echo "  TASK_DEFINITION_DELETE_ARN: ${TASK_DEFINITION_DELETE_ARN:-[NOT FOUND]}"
+echo "  SUBNETS: $SUBNETS"
+echo "  SECURITY_GROUPS: $SECURITY_GROUPS"
+echo ""
+
+# Check for missing variables
+MISSING_VARS=0
+if [ -z "$TASK_EXECUTION_ROLE_ARN" ]; then
+  echo "⚠️  WARNING: TASK_EXECUTION_ROLE_ARN not found"
+  MISSING_VARS=1
+fi
+if [ -z "$TASK_ROLE_ARN" ]; then
+  echo "⚠️  WARNING: TASK_ROLE_ARN not found"
+  MISSING_VARS=1
+fi
+if [ -z "$EVENTBRIDGE_ROLE_ARN" ]; then
+  echo "⚠️  WARNING: EVENTBRIDGE_ROLE_ARN not found"
+  MISSING_VARS=1
+fi
+if [ -z "$TASK_DEFINITION_CREATE_ARN" ]; then
+  echo "⚠️  WARNING: TASK_DEFINITION_CREATE_ARN not found"
+  MISSING_VARS=1
+fi
+if [ -z "$TASK_DEFINITION_DELETE_ARN" ]; then
+  echo "⚠️  WARNING: TASK_DEFINITION_DELETE_ARN not found"
+  MISSING_VARS=1
+fi
+
+if [ $MISSING_VARS -eq 0 ]; then
+  echo "✓ All environment variables loaded successfully!"
+else
+  echo ""
+  echo "Some resources may not exist yet. Please ensure you've completed the deployment steps."
+fi
+EOF
+```
+
+Make the script executable:
+
+```bash
+chmod +x deploy-to-aws-ecs/load-aws-env.sh
+```
+
+> **Note**: During initial deployment, this script will show warnings for resources that don't exist yet. Once you complete all steps, it will successfully load all variables. You can use this script anytime you need to work with the deployment.
 
 ### Step 1: Create Task Execution Role
 
@@ -904,6 +1087,337 @@ aws logs tail \
 >
 > - Backups will be created daily at 5 AM UTC
 > - Old backups will be deleted weekly on Sundays at 6 AM UTC
+
+## Update ECS Task Definitions for New Image Releases
+
+When you release a new version of the Docker image (with a different tag), you need to update the ECS task definitions to use the new image. The EventBridge schedules will automatically use the latest revision of the task definitions.
+
+> **Prerequisites**: Ensure you have built, tagged, and pushed the new Docker image to ECR following the steps in the [Generate our patamu-purchases-db-backup-php image](#generate-our-patamu-purchases-db-backup-php-image) section.
+>
+> **Tip**: Before starting, run `source deploy-to-aws-ecs/load-aws-env.sh` to load all required environment variables. See [Loading AWS Environment Variables](#loading-aws-environment-variables) for details.
+
+### Step 1: Verify the New Image in ECR
+
+Before updating task definitions, confirm the new image exists in ECR.
+
+```bash
+# List all images in the repository
+aws ecr list-images \
+  --profile lluisaznar \
+  --repository-name patamu-purchases-db-backup-php \
+  --query 'imageIds[*].imageTag' \
+  --output table
+```
+
+> **Note**: Look for your new image tag (e.g., `production-202602171200-r0`) in the output.
+
+### Step 2: Store Role ARNs in Variables
+
+If you haven't already loaded the environment variables using `source deploy-to-aws-ecs/load-aws-env.sh`, retrieve them manually:
+
+> **Skip this step** if you've already run `source deploy-to-aws-ecs/load-aws-env.sh`.
+
+```bash
+TASK_EXECUTION_ROLE_ARN=$(aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--execution \
+  --query 'Role.Arn' \
+  --output text)
+
+TASK_ROLE_ARN=$(aws iam get-role \
+  --profile lluisaznar \
+  --role-name patamu-purchases-db-backup--iam--role--task \
+  --query 'Role.Arn' \
+  --output text)
+
+echo "Task Execution Role ARN: $TASK_EXECUTION_ROLE_ARN"
+echo "Task Role ARN: $TASK_ROLE_ARN"
+```
+
+### Step 3: Update Backup Creation Task Definition
+
+Update the task definition file with the new image tag.
+
+> **Important**: Replace `<IMAGE_TAG>` with your actual new image tag.
+
+```bash
+cat > deploy-to-aws-ecs/task-definition-create.json << EOF
+{
+    "family": "patamu-purchases-db-backup-create",
+    "containerDefinitions": [
+        {
+            "name": "php",
+            "image": "<IMAGE_TAG>",
+            "memory": 1920,
+            "essential": true,
+            "environment": [
+                {
+                    "name": "ARTISAN_COMMAND",
+                    "value": "db-backup:create"
+                }
+            ],
+            "linuxParameters": {
+                "capabilities": {
+                    "drop": [
+                        "AUDIT_CONTROL",
+                        "BLOCK_SUSPEND",
+                        "CHOWN",
+                        "DAC_OVERRIDE",
+                        "DAC_READ_SEARCH",
+                        "FOWNER",
+                        "FSETID",
+                        "IPC_LOCK",
+                        "IPC_OWNER",
+                        "KILL",
+                        "LEASE",
+                        "LINUX_IMMUTABLE",
+                        "MAC_ADMIN",
+                        "MAC_OVERRIDE",
+                        "MKNOD",
+                        "NET_ADMIN",
+                        "NET_BIND_SERVICE",
+                        "NET_BROADCAST",
+                        "NET_RAW",
+                        "SETFCAP",
+                        "SETPCAP",
+                        "SYS_ADMIN",
+                        "SYS_BOOT",
+                        "SYS_CHROOT",
+                        "SYS_MODULE",
+                        "SYS_NICE",
+                        "SYS_PACCT",
+                        "SYS_PTRACE",
+                        "SYS_RAWIO",
+                        "SYS_RESOURCE",
+                        "SYS_TIME",
+                        "SYS_TTY_CONFIG",
+                        "SYSLOG",
+                        "WAKE_ALARM"
+                    ]
+                }
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "patamu-purchases--db-backup--container--php-cli--log-group",
+                    "awslogs-region": "eu-central-1",
+                    "awslogs-stream-prefix": "patamu-purchases--db-backup--container--php-cli"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "$TASK_ROLE_ARN",
+    "executionRoleArn": "$TASK_EXECUTION_ROLE_ARN",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "2048"
+}
+EOF
+```
+
+### Step 4: Register the Updated Backup Creation Task Definition
+
+```bash
+aws ecs register-task-definition \
+  --profile lluisaznar \
+  --cli-input-json file://deploy-to-aws-ecs/task-definition-create.json
+```
+
+Expected output should show the new revision number (e.g., `revision: 2`).
+
+### Step 5: Update Backup Deletion Task Definition
+
+Update the deletion task definition with the same new image tag.
+
+> **Important**: Replace `<IMAGE_TAG>` with your actual new image tag.
+
+```bash
+cat > deploy-to-aws-ecs/task-definition-delete.json << EOF
+{
+    "family": "patamu-purchases-db-backup-delete",
+    "containerDefinitions": [
+        {
+            "name": "php",
+            "image": "<IMAGE_TAG>",
+            "memory": 1920,
+            "essential": true,
+            "environment": [
+                {
+                    "name": "ARTISAN_COMMAND",
+                    "value": "db-backup:delete"
+                }
+            ],
+            "linuxParameters": {
+                "capabilities": {
+                    "drop": [
+                        "AUDIT_CONTROL",
+                        "BLOCK_SUSPEND",
+                        "CHOWN",
+                        "DAC_OVERRIDE",
+                        "DAC_READ_SEARCH",
+                        "FOWNER",
+                        "FSETID",
+                        "IPC_LOCK",
+                        "IPC_OWNER",
+                        "KILL",
+                        "LEASE",
+                        "LINUX_IMMUTABLE",
+                        "MAC_ADMIN",
+                        "MAC_OVERRIDE",
+                        "MKNOD",
+                        "NET_ADMIN",
+                        "NET_BIND_SERVICE",
+                        "NET_BROADCAST",
+                        "NET_RAW",
+                        "SETFCAP",
+                        "SETPCAP",
+                        "SYS_ADMIN",
+                        "SYS_BOOT",
+                        "SYS_CHROOT",
+                        "SYS_MODULE",
+                        "SYS_NICE",
+                        "SYS_PACCT",
+                        "SYS_PTRACE",
+                        "SYS_RAWIO",
+                        "SYS_RESOURCE",
+                        "SYS_TIME",
+                        "SYS_TTY_CONFIG",
+                        "SYSLOG",
+                        "WAKE_ALARM"
+                    ]
+                }
+            },
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "patamu-purchases--db-backup--container--php-cli--log-group",
+                    "awslogs-region": "eu-central-1",
+                    "awslogs-stream-prefix": "patamu-purchases--db-backup--container--php-cli"
+                }
+            }
+        }
+    ],
+    "taskRoleArn": "$TASK_ROLE_ARN",
+    "executionRoleArn": "$TASK_EXECUTION_ROLE_ARN",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "256",
+    "memory": "2048"
+}
+EOF
+```
+
+### Step 6: Register the Updated Backup Deletion Task Definition
+
+```bash
+aws ecs register-task-definition \
+  --profile lluisaznar \
+  --cli-input-json file://deploy-to-aws-ecs/task-definition-delete.json
+```
+
+### Step 7: Verify the New Task Definitions
+
+Check that the new revisions are registered and active.
+
+```bash
+echo "=== Backup Creation Task Definition (Latest Revision) ==="
+aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup-create \
+  --query 'taskDefinition.{Family:family,Revision:revision,Status:status,Image:containerDefinitions[0].image}' \
+  --output table
+
+echo ""
+echo "=== Backup Deletion Task Definition (Latest Revision) ==="
+aws ecs describe-task-definition \
+  --profile lluisaznar \
+  --task-definition patamu-purchases-db-backup-delete \
+  --query 'taskDefinition.{Family:family,Revision:revision,Status:status,Image:containerDefinitions[0].image}' \
+  --output table
+```
+
+Verify that the output shows:
+
+- The new revision number
+- Status is `ACTIVE`
+- Image tag matches your new Docker image tag
+
+### Step 8: Test the New Task Definitions
+
+Before waiting for the schedules, manually test both tasks to ensure they work correctly with the new image.
+
+**Set network configuration variables** (skip if you've already run `source deploy-to-aws-ecs/load-aws-env.sh`):
+
+```bash
+SUBNETS="subnet-0425fdfb5541b7a9c,subnet-092dd5929001c7a12"
+SECURITY_GROUPS="sg-08ccd68bb58faa5f3,sg-023f4f99f90f9e3d6,sg-0ba7bab5f6f64d623"
+```
+
+**Test backup creation with the new image:**
+
+```bash
+aws ecs run-task \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --task-definition patamu-purchases-db-backup-create \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=DISABLED}"
+```
+
+**Test backup deletion with the new image:**
+
+```bash
+aws ecs run-task \
+  --profile lluisaznar \
+  --cluster patamu-purchases--cluster \
+  --task-definition patamu-purchases-db-backup-delete \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=DISABLED}"
+```
+
+### Step 9: Monitor the Test Task Logs
+
+Check CloudWatch Logs to ensure the tasks completed successfully:
+
+```bash
+aws logs tail \
+  --profile lluisaznar \
+  --follow \
+  patamu-purchases--db-backup--container--php-cli--log-group
+```
+
+Look for successful completion messages and verify there are no errors.
+
+### Step 10: Verify EventBridge Schedules
+
+The EventBridge schedules **automatically use the latest `ACTIVE` revision** of each task definition, so no updates to the schedules are required.
+
+Verify the schedules are still configured correctly:
+
+```bash
+echo "=== Backup Creation Schedule ==="
+aws scheduler get-schedule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup--event--create \
+  --query '{Name:Name,State:State,TaskDef:Target.EcsParameters.TaskDefinitionArn}' \
+  --output table
+
+echo ""
+echo "=== Backup Deletion Schedule ==="
+aws scheduler get-schedule \
+  --profile lluisaznar \
+  --name patamu-purchases-db-backup--event--delete \
+  --query '{Name:Name,State:State,TaskDef:Target.EcsParameters.TaskDefinitionArn}' \
+  --output table
+```
+
+> **Note**: The `TaskDefinitionArn` shown in the schedules will still reference the old revision number, but when the schedule triggers, ECS will use the latest `ACTIVE` revision automatically.
+> **Success!** Your task definitions have been updated to use the new Docker image. The schedules will use the new image version on their next execution.
 
 ## **Hints**
 
