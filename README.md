@@ -1138,7 +1138,7 @@ echo "Task Role ARN: $TASK_ROLE_ARN"
 
 Update the task definition file with the new image tag.
 
-> **Important**: Replace `<IMAGE_TAG>` with your actual new image tag.
+> **Important**: Replace `<IMAGE_FULL_TAG>` with your actual new image tag.
 
 ```bash
 cat > deploy-to-aws-ecs/task-definition-create.json << EOF
@@ -1147,7 +1147,7 @@ cat > deploy-to-aws-ecs/task-definition-create.json << EOF
     "containerDefinitions": [
         {
             "name": "php",
-            "image": "<IMAGE_TAG>",
+            "image": "<IMAGE_FULL_TAG>",
             "memory": 1920,
             "essential": true,
             "environment": [
@@ -1232,7 +1232,7 @@ Expected output should show the new revision number (e.g., `revision: 2`).
 
 Update the deletion task definition with the same new image tag.
 
-> **Important**: Replace `<IMAGE_TAG>` with your actual new image tag.
+> **Important**: Replace `<IMAGE_FULL_TAG>` with your actual new image tag.
 
 ```bash
 cat > deploy-to-aws-ecs/task-definition-delete.json << EOF
@@ -1241,7 +1241,7 @@ cat > deploy-to-aws-ecs/task-definition-delete.json << EOF
     "containerDefinitions": [
         {
             "name": "php",
-            "image": "<IMAGE_TAG>",
+            "image": "<IMAGE_FULL_TAG>",
             "memory": 1920,
             "essential": true,
             "environment": [
