@@ -92,7 +92,7 @@ parse_env_file() {
 parse_env_template() {
     init_os_env_array
 
-    while read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "${line// }" ]]; then
             continue
         fi
