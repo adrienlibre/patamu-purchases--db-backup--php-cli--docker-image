@@ -144,3 +144,8 @@ RUN --mount=type=secret,id=github-personal-access-token,required \
 # change user to www-data
 # note: we do it for security reasons, to avoid running the containerized web app as root
 USER www-data
+
+# Override base image's CMD to pass no arguments
+# This allows the entrypoint to use the ARTISAN_COMMAND environment variable
+# instead of inheriting the base image's CMD (likely "php -a")
+CMD []
