@@ -10,7 +10,7 @@ if [ -d /source ] && [ "$(find /source -mindepth 1 -print -quit)" ]; then
 
     # Move all the source files to the cli application directory (which, on production, is also the mounted path of the volume).
     # The command will override the existing files and directories in the /opt/innovaetica-cli-app/ directory
-    rsync -a --delete --exclude='storage/' /source/ /opt/innovaetica-cli-app/
+    rsync -a --delete /source/ /opt/innovaetica-cli-app/
 
     # Synchronize the storage directory separately
     if [ -d /source/storage/ ]; then
