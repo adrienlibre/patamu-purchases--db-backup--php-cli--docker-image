@@ -926,6 +926,10 @@ SUBNETS="subnet-0425fdfb5541b7a9c,subnet-092dd5929001c7a12"
 # Set security groups as comma-separated values (replace with your actual security group IDs)
 SECURITY_GROUPS="sg-08ccd68bb58faa5f3,sg-023f4f99f90f9e3d6,sg-0ba7bab5f6f64d623"
 
+# Convert to JSON array format for EventBridge (required for proper network configuration)
+SUBNETS_JSON=$(echo "$SUBNETS" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')
+SECURITY_GROUPS_JSON=$(echo "$SECURITY_GROUPS" | sed 's/,/","/g' | sed 's/^/"/' | sed 's/$/"/')
+
 echo "Subnets: $SUBNETS"
 echo "Security Groups: $SECURITY_GROUPS"
 ```
@@ -950,8 +954,8 @@ aws scheduler create-schedule \
       \"LaunchType\": \"FARGATE\",
       \"NetworkConfiguration\": {
         \"awsvpcConfiguration\": {
-          \"Subnets\": [\"$SUBNETS\"],
-          \"SecurityGroups\": [\"$SECURITY_GROUPS\"],
+          \"Subnets\": [$SUBNETS_JSON],
+          \"SecurityGroups\": [$SECURITY_GROUPS_JSON],
           \"AssignPublicIp\": \"DISABLED\"
         }
       }
@@ -979,8 +983,8 @@ aws scheduler create-schedule \
       \"LaunchType\": \"FARGATE\",
       \"NetworkConfiguration\": {
         \"awsvpcConfiguration\": {
-          \"Subnets\": [\"$SUBNETS\"],
-          \"SecurityGroups\": [\"$SECURITY_GROUPS\"],
+          \"Subnets\": [$SUBNETS_JSON],
+          \"SecurityGroups\": [$SECURITY_GROUPS_JSON],
           \"AssignPublicIp\": \"DISABLED\"
         }
       }
